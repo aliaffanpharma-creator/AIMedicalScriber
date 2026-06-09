@@ -12,7 +12,13 @@ type Patient = {
   date: number;
 };
 
+// ---------- Helper to format patient ID ----------
+function formatPatientId(id: string) {
+  return `PT-${id.slice(-6)}`;
+}
+
 export default function Home() {
+  // ---------- Existing state (from original app) ----------
   const [specialty, setSpecialty] = useState('General Practice');
   const [recording, setRecording] = useState(false);
   const [transcript, setTranscript] = useState('');
@@ -23,11 +29,27 @@ export default function Home() {
   const [patientName, setPatientName] = useState('');
   const [patientAge, setPatientAge] = useState('');
   const [patientGender, setPatientGender] = useState('M');
-
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
-  // Load patients from IndexedDB on mount
+  // ---------- UI navigation state ----------
+  type Screen = 'login' | 'home' | 'recording' | 'processing' | 'soap' | 'history' | 'settings';
+  const [currentScreen, setCurrentScreen] = useState<Screen>('login');
+  const [darkRecording, setDarkRecording] = useState(false);
+  const [waveformAmplitude, setWaveformAmplitude] = useState<number[]>(Array(20).fill(10));
+  const [recordingTimer, setRecordingTimer] = useState(0);
+  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [expandedSections, setExpandedSections] = useState({
+    subjective: true,
+    objective: true,
+    assessment: true,
+    plan: true,
+  });
+  const [processingStage, setProcessingStage] = useState(0); // 0=transcribing,1=analyzing,2=soap
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+
+  // ---------- Load patients from IndexedDB ----------
   useEffect(() => {
     localforage.config({ name: 'MedicalScriberDB', storeName: 'patients' });
     loadPatients();
@@ -54,6 +76,7 @@ export default function Home() {
     return id;
   }
 
+  // ---------- Recording & AI logic (same as before, but adapted) ----------
   async function startRecording() {
     audioChunksRef.current = [];
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -63,17 +86,18 @@ export default function Home() {
     };
     mediaRecorderRef.current.onstop = async () => {
       const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+      setCurrentScreen('processing');
+      setProcessingStage(0);
       setIsProcessing(true);
       try {
-        // Upload to /api/transcribe
         const formData = new FormData();
         formData.append('file', audioBlob, 'recording.webm');
         const transcribeRes = await fetch('/api/transcribe', { method: 'POST', body: formData });
         if (!transcribeRes.ok) throw new Error('Transcription failed');
         const { transcript: rawTranscript } = await transcribeRes.json();
         setTranscript(rawTranscript);
+        setProcessingStage(1);
 
-        // Generate note
         const noteRes = await fetch('/api/generate-note', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -83,20 +107,40 @@ export default function Home() {
         const { note } = await noteRes.json();
         setGeneratedNote(note);
         setEditableNote(note);
+        setProcessingStage(2);
+        setTimeout(() => {
+          setCurrentScreen('soap');
+          setIsProcessing(false);
+        }, 800);
       } catch (err: any) {
         alert('Error: ' + err.message);
-      } finally {
+        setCurrentScreen('home');
         setIsProcessing(false);
+      } finally {
         stream.getTracks().forEach(track => track.stop());
+        if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+        setRecordingTimer(0);
+        setRecording(false);
       }
     };
     mediaRecorderRef.current.start();
     setRecording(true);
+    setCurrentScreen('recording');
+    // start timer
+    timerIntervalRef.current = setInterval(() => {
+      setRecordingTimer(prev => prev + 1);
+    }, 1000);
+    // fake waveform animation
+    const interval = setInterval(() => {
+      setWaveformAmplitude(Array(20).fill(0).map(() => Math.floor(Math.random() * 40) + 5));
+    }, 150);
+    return () => clearInterval(interval);
   }
 
   function stopRecording() {
     if (mediaRecorderRef.current && recording) {
       mediaRecorderRef.current.stop();
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
       setRecording(false);
     }
   }
@@ -120,25 +164,13 @@ export default function Home() {
       transcript,
     });
     alert('Patient record saved!');
-  }
-
-  function loadPatient(patient: Patient) {
-    setPatientName(patient.name);
-    setPatientAge(patient.age);
-    setPatientGender(patient.gender);
-    setSpecialty(patient.specialty);
-    setGeneratedNote(patient.note);
-    setEditableNote(patient.note);
-    setTranscript(patient.transcript || '');
+    setCurrentScreen('home');
   }
 
   async function exportToPDF() {
     const element = document.getElementById('note-preview-container');
     if (!element) return;
-    
-    // Dynamically import html2pdf only on client side
     const html2pdf = (await import('html2pdf.js')).default;
-    
     const opt = {
       margin: 0.5,
       filename: `consultation_${patientName || 'patient'}.pdf`,
@@ -149,177 +181,162 @@ export default function Home() {
     html2pdf().set(opt).from(element).save();
   }
 
-  return (
-    <div className="min-h-screen bg-gray-100 p-4 md:p-6">
-      <div className="max-w-6xl mx-auto">
-        <header className="bg-blue-700 text-white p-4 rounded-xl shadow mb-6">
-          <h1 className="text-2xl md:text-3xl font-bold">🩺 AI Medical Scriber – Pakistan</h1>
-          <p className="text-blue-100">Record → AI SOAP Note → PDF & Local Records</p>
-        </header>
+  // Helper to format timer
+  const formatTime = (sec: number) => {
+    const mins = Math.floor(sec / 60);
+    const remainSec = sec % 60;
+    return `${mins.toString().padStart(2, '0')}:${remainSec.toString().padStart(2, '0')}`;
+  };
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left Panel */}
-          <div className="lg:col-span-1 space-y-5">
-            <div className="bg-white p-4 rounded-xl shadow">
-              <h2 className="font-semibold text-lg mb-3">1. Patient Info</h2>
-              <input
-                type="text"
-                placeholder="Full Name"
-                value={patientName}
-                onChange={(e) => setPatientName(e.target.value)}
-                className="w-full border rounded p-2 mb-2"
-              />
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="Age"
-                  value={patientAge}
-                  onChange={(e) => setPatientAge(e.target.value)}
-                  className="w-1/2 border rounded p-2"
-                />
-                <select
-                  value={patientGender}
-                  onChange={(e) => setPatientGender(e.target.value)}
-                  className="w-1/2 border rounded p-2"
-                >
-                  <option>M</option>
-                  <option>F</option>
-                  <option>Other</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow">
-              <h2 className="font-semibold text-lg mb-3">2. Specialty Template</h2>
-              <select
-                value={specialty}
-                onChange={(e) => setSpecialty(e.target.value)}
-                className="w-full border rounded p-2"
-              >
-                <option>General Practice</option>
-                <option>Cardiology</option>
-                <option>Gynecology</option>
-                <option>Pediatrics</option>
-                <option>Psychiatry</option>
-              </select>
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow">
-              <h2 className="font-semibold text-lg mb-3">3. Recording</h2>
-              <div className="flex gap-3">
-                <button
-                  onClick={startRecording}
-                  disabled={recording}
-                  className={`flex-1 py-2 rounded font-bold ${
-                    recording ? 'bg-gray-400' : 'bg-red-600 hover:bg-red-700 text-white'
-                  }`}
-                >
-                  <i className="fas fa-microphone mr-2"></i>Start
-                </button>
-                <button
-                  onClick={stopRecording}
-                  disabled={!recording}
-                  className={`flex-1 py-2 rounded font-bold ${
-                    !recording ? 'bg-gray-400' : 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                  }`}
-                >
-                  <i className="fas fa-stop mr-2"></i>Stop
-                </button>
-              </div>
-              {isProcessing && (
-                <div className="mt-3 text-blue-600 text-center">
-                  <i className="fas fa-spinner fa-pulse"></i> Transcribing & generating note...
-                </div>
-              )}
-              {transcript && (
-                <div className="mt-3 text-xs text-gray-500 border-t pt-2">
-                  <strong>Raw transcript:</strong> {transcript.substring(0, 150)}...
-                </div>
-              )}
-            </div>
-
-            <div className="bg-white p-4 rounded-xl shadow">
-              <h2 className="font-semibold text-lg mb-3">4. Actions</h2>
-              <button
-                onClick={handleSaveRecord}
-                className="w-full bg-green-600 text-white py-2 rounded mb-2 hover:bg-green-700"
-              >
-                <i className="fas fa-save mr-2"></i>Save Patient Record
-              </button>
-              <button
-                onClick={exportToPDF}
-                className="w-full bg-purple-600 text-white py-2 rounded hover:bg-purple-700"
-              >
-                <i className="fas fa-file-pdf mr-2"></i>Export PDF
-              </button>
-            </div>
+  // ---------- UI Components per screen ----------
+  const renderLogin = () => (
+    <div className="flex flex-col items-center justify-center min-h-screen p-6 bg-gradient-to-br from-white to-gray-50">
+      <div className="w-full max-w-sm">
+        <div className="text-center mb-8">
+          <div className="w-20 h-20 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
+            <i className="fas fa-microphone-alt text-white text-3xl"></i>
           </div>
-
-          {/* Middle Panel – Editable Note */}
-          <div className="lg:col-span-2 space-y-5">
-            <div className="bg-white p-4 rounded-xl shadow">
-              <h2 className="font-semibold text-lg mb-2 flex justify-between">
-                <span>📋 AI Generated SOAP Note</span>
-                <span className="text-xs text-gray-400">Editable</span>
-              </h2>
-              <textarea
-                rows={14}
-                value={editableNote}
-                onChange={(e) => setEditableNote(e.target.value)}
-                className="w-full border rounded p-3 font-mono text-sm"
-                placeholder="Generated note will appear here. You can edit before saving."
-              />
-            </div>
-
-            {/* Hidden PDF container */}
-            <div id="note-preview-container" className="hidden">
-              <div className="p-6 bg-white" style={{ fontFamily: 'Arial' }}>
-                <h2 className="text-xl font-bold">Clinical Consultation Note</h2>
-                <p>
-                  <strong>Patient:</strong> {patientName || '____'} | <strong>Age:</strong> {patientAge} |{' '}
-                  <strong>Gender:</strong> {patientGender}
-                </p>
-                <p>
-                  <strong>Specialty:</strong> {specialty} | <strong>Date:</strong> {new Date().toLocaleDateString()}
-                </p>
-                <hr className="my-2" />
-                <div className="whitespace-pre-wrap text-sm">{editableNote || 'No note generated.'}</div>
-                <hr className="my-2" />
-                <p className="text-xs text-gray-500 mt-4">
-                  Generated by AI Medical Scriber – Doctor's signature & stamp
-                </p>
-              </div>
-            </div>
-          </div>
+          <h1 className="text-2xl font-bold text-gray-800">AI Medical Scriber</h1>
+          <p className="text-gray-500 mt-1">Secure clinical documentation</p>
         </div>
-
-        {/* Patient History */}
-        <div className="mt-8 bg-white rounded-xl shadow p-4">
-          <h2 className="font-semibold text-xl mb-3">📚 Previous Patient Records</h2>
-          {patients.length === 0 && <p className="text-gray-400">No records yet. Save a consultation.</p>}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {patients.map((pat) => (
-              <div
-                key={pat.id}
-                onClick={() => loadPatient(pat)}
-                className="border rounded-lg p-3 cursor-pointer hover:bg-gray-50 transition"
-              >
-                <div className="font-bold">
-                  {pat.name} ({pat.age}, {pat.gender})
-                </div>
-                <div className="text-xs text-gray-500">
-                  {new Date(pat.date).toLocaleString()} – {pat.specialty}
-                </div>
-                <div className="text-sm truncate">{pat.note.substring(0, 80)}...</div>
-              </div>
-            ))}
-          </div>
+        <div className="space-y-4">
+          <input type="email" placeholder="Hospital email" value={loginEmail} onChange={e=>setLoginEmail(e.target.value)} className="w-full p-4 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          <input type="password" placeholder="Password" value={loginPassword} onChange={e=>setLoginPassword(e.target.value)} className="w-full p-4 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          <button onClick={() => setCurrentScreen('home')} className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-4 rounded-xl transition-all shadow-md">Log in</button>
+          <button className="w-full border border-gray-300 py-4 rounded-xl flex items-center justify-center gap-2"><i className="fas fa-fingerprint text-blue-600"></i> Use Face ID / Biometric</button>
+          <p className="text-center text-sm text-gray-500 mt-4"><a href="#" className="text-blue-600">Forgot password?</a> · <a href="#" className="text-blue-600">SSO with hospital</a></p>
         </div>
-
-        <footer className="text-center text-gray-400 text-sm mt-8">
-          Secure local storage (IndexedDB) – no data leaves your browser except AI APIs.
-        </footer>
       </div>
     </div>
   );
+
+  const renderHome = () => (
+    <div className="bg-gray-50 min-h-screen pb-20">
+      <div className="bg-white p-6 shadow-sm">
+        <h1 className="text-2xl font-bold text-gray-800">Good morning, Dr. Ahmed</h1>
+        <p className="text-gray-500 mt-1">{new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })} · 8 patients today</p>
+      </div>
+      <div className="p-4 space-y-4">
+        <div className="bg-white rounded-2xl p-4 shadow-sm">
+          <h2 className="font-semibold text-gray-700 mb-2">Recent sessions</h2>
+          {patients.slice(0, 3).map(pat => (
+            <div key={pat.id} className="flex justify-between items-center py-3 border-b last:border-0">
+              <div><p className="font-medium">{formatPatientId(pat.id)}</p><p className="text-xs text-gray-400">{new Date(pat.date).toLocaleTimeString()}</p></div>
+              <span className="px-2 py-1 rounded-full text-xs bg-green-100 text-green-700">Reviewed</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <button onClick={startRecording} className="fixed bottom-24 right-6 w-16 h-16 bg-red-500 rounded-full shadow-xl flex items-center justify-center text-white text-2xl hover:scale-105 transition"><i className="fas fa-microphone"></i></button>
+      <BottomNav current="home" setScreen={setCurrentScreen} />
+    </div>
+  );
+
+  const renderRecording = () => (
+    <div className={`min-h-screen flex flex-col ${darkRecording ? 'bg-gray-900 text-white' : 'bg-white'}`}>
+      <div className="flex justify-between p-6 items-center">
+        <button onClick={() => { setCurrentScreen('home'); if(recording) stopRecording(); }}><i className="fas fa-arrow-left text-xl"></i></button>
+        <button onClick={() => setDarkRecording(!darkRecording)}><i className={`fas ${darkRecording ? 'fa-sun' : 'fa-moon'} text-xl`}></i></button>
+      </div>
+      <div className="flex-1 flex flex-col items-center justify-center px-6">
+        <div className="text-center mb-8">
+          <p className="text-sm opacity-70">Recording · {formatTime(recordingTimer)}</p>
+          <div className="flex gap-1 mt-4 h-12 items-center justify-center">
+            {waveformAmplitude.map((h, idx) => <div key={idx} className="w-2 bg-blue-500 rounded-full transition-all duration-75" style={{ height: `${Math.min(40, Math.max(8, h))}px` }}></div>)}
+          </div>
+        </div>
+        <div className="bg-gray-100 dark:bg-gray-800 rounded-2xl p-4 w-full max-h-64 overflow-y-auto">
+          <p className="text-sm font-mono">{transcript || "Doctor: What brings you today?\nPatient: I've had a cough for two weeks..."}</p>
+        </div>
+      </div>
+      <div className="p-8 flex justify-center">
+        <button onClick={stopRecording} className="w-20 h-20 bg-red-600 rounded-full flex items-center justify-center text-white text-2xl shadow-lg"><i className="fas fa-stop"></i></button>
+      </div>
+    </div>
+  );
+
+  const renderProcessing = () => (
+    <div className="min-h-screen bg-white flex flex-col items-center justify-center p-6">
+      <div className="w-24 h-24 rounded-full border-4 border-blue-200 border-t-blue-600 animate-spin mb-6"></div>
+      <p className="text-xl font-semibold">{processingStage === 0 ? 'Transcribing conversation...' : processingStage === 1 ? 'Analyzing medical content...' : 'Generating SOAP note...'}</p>
+      <p className="text-gray-500 mt-2">Please wait, AI is working</p>
+      <button onClick={() => setCurrentScreen('home')} className="mt-8 text-blue-600">Cancel</button>
+    </div>
+  );
+
+  const renderSoap = () => (
+    <div className="bg-gray-50 min-h-screen pb-24">
+      <div className="sticky top-0 bg-white p-4 border-b flex justify-between items-center">
+        <button onClick={() => setCurrentScreen('home')}><i className="fas fa-arrow-left text-xl"></i></button>
+        <h1 className="font-bold text-lg">SOAP Note</h1>
+        <button onClick={exportToPDF}><i className="fas fa-share-alt text-xl text-blue-600"></i></button>
+      </div>
+      <div className="p-4 space-y-4">
+        {['subjective', 'objective', 'assessment', 'plan'].map(section => (
+          <div key={section} className="bg-white rounded-2xl shadow-sm overflow-hidden">
+            <button onClick={() => setExpandedSections(prev => ({ ...prev, [section]: !prev[section] }))} className="w-full flex justify-between items-center p-4 font-semibold capitalize bg-gray-50">{section} <i className={`fas fa-chevron-${expandedSections[section] ? 'up' : 'down'}`}></i></button>
+            {expandedSections[section] && <div className="p-4 border-t"><textarea className="w-full p-2 border rounded-lg" rows={4} value={editableNote.split('\n').find(l => l.toLowerCase().includes(section)) || ''} onChange={e => setEditableNote(e.target.value)} /></div>}
+          </div>
+        ))}
+      </div>
+      <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t flex gap-3">
+        <button onClick={handleSaveRecord} className="flex-1 bg-blue-600 text-white py-3 rounded-xl font-semibold">Save to history</button>
+        <button onClick={exportToPDF} className="flex-1 border border-blue-600 text-blue-600 py-3 rounded-xl font-semibold">Export PDF</button>
+      </div>
+      <div id="note-preview-container" className="hidden"><div>{editableNote}</div></div>
+    </div>
+  );
+
+  const renderHistory = () => (
+    <div className="bg-gray-50 min-h-screen pb-20">
+      <div className="bg-white p-4 border-b sticky top-0"><input type="search" placeholder="Search patients..." className="w-full p-3 border rounded-xl" /></div>
+      <div className="p-4 space-y-3">
+        {patients.map(pat => (
+          <div key={pat.id} className="bg-white rounded-xl p-4 shadow-sm flex justify-between items-center">
+            <div><p className="font-medium">{formatPatientId(pat.id)}</p><p className="text-xs text-gray-500">{new Date(pat.date).toLocaleString()}</p><span className="text-xs text-green-600">Reviewed</span></div>
+            <button onClick={() => { setPatientName(pat.name); setPatientAge(pat.age); setPatientGender(pat.gender); setSpecialty(pat.specialty); setEditableNote(pat.note); setGeneratedNote(pat.note); setCurrentScreen('soap'); }} className="text-blue-600"><i className="fas fa-eye"></i></button>
+          </div>
+        ))}
+      </div>
+      <BottomNav current="history" setScreen={setCurrentScreen} />
+    </div>
+  );
+
+  const renderSettings = () => (
+    <div className="bg-gray-50 min-h-screen pb-20">
+      <div className="bg-white p-6 border-b"><h1 className="text-xl font-bold">Settings</h1></div>
+      <div className="p-4 space-y-4">
+        <div className="bg-white rounded-xl p-4"><p className="font-medium">Dr. Ahmed Khan</p><p className="text-sm text-gray-500">Cardiology · City Hospital</p></div>
+        <div className="bg-white rounded-xl p-4 flex justify-between"><span>Language</span><span>English <i className="fas fa-chevron-right ml-2"></i></span></div>
+        <div className="bg-white rounded-xl p-4 flex justify-between"><span>EHR Integration</span><div className="w-10 h-6 bg-blue-600 rounded-full relative"><div className="absolute right-1 top-1 w-4 h-4 bg-white rounded-full"></div></div></div>
+        <div className="bg-white rounded-xl p-4 flex justify-between"><span>Notifications</span><div className="w-10 h-6 bg-gray-300 rounded-full"></div></div>
+        <button onClick={() => setCurrentScreen('login')} className="w-full bg-red-50 text-red-600 py-3 rounded-xl">Log out</button>
+      </div>
+      <BottomNav current="settings" setScreen={setCurrentScreen} />
+    </div>
+  );
+
+  const BottomNav = ({ current, setScreen }: { current: string, setScreen: (s: Screen) => void }) => (
+    <div className="fixed bottom-0 left-0 right-0 bg-white border-t flex justify-around py-2">
+      {['home', 'history', 'settings'].map(icon => (
+        <button key={icon} onClick={() => setScreen(icon as Screen)} className={`flex flex-col items-center py-2 px-6 rounded-full ${current === icon ? 'text-blue-600' : 'text-gray-400'}`}>
+          <i className={`fas fa-${icon === 'home' ? 'home' : icon === 'history' ? 'history' : 'user'} text-xl`}></i>
+          <span className="text-xs mt-1 capitalize">{icon}</span>
+        </button>
+      ))}
+      <button onClick={startRecording} className="bg-red-500 text-white p-3 rounded-full -mt-6 shadow-lg"><i className="fas fa-microphone text-xl"></i></button>
+    </div>
+  );
+
+  // Routing
+  switch (currentScreen) {
+    case 'login': return renderLogin();
+    case 'home': return renderHome();
+    case 'recording': return renderRecording();
+    case 'processing': return renderProcessing();
+    case 'soap': return renderSoap();
+    case 'history': return renderHistory();
+    case 'settings': return renderSettings();
+    default: return renderHome();
+  }
 }
