@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
 import localforage from 'localforage';
-import html2pdf from 'html2pdf.js';
 
 type Patient = {
   id: string;
@@ -133,9 +132,13 @@ export default function Home() {
     setTranscript(patient.transcript || '');
   }
 
-  function exportToPDF() {
+  async function exportToPDF() {
     const element = document.getElementById('note-preview-container');
     if (!element) return;
+    
+    // Dynamically import html2pdf only on client side
+    const html2pdf = (await import('html2pdf.js')).default;
+    
     const opt = {
       margin: 0.5,
       filename: `consultation_${patientName || 'patient'}.pdf`,
